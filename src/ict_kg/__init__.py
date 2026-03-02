@@ -1,0 +1,1 @@
+"""ICT knowledge graph package."""
