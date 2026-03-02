@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import * as d3 from "d3";
 
-const API_BASE = ""; // Use empty string to route through Vite proxy
+const API_BASE = import.meta.env.VITE_API_BASE ?? "";
 const TENANT_ID = import.meta.env.VITE_TENANT_ID ?? "default";
 const ROLE = import.meta.env.VITE_ROLE ?? "admin";
 

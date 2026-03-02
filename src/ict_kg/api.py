@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 from .auth import AUTH_MODE, create_access_token, decode_access_token, role_allowed
 from .models import (
@@ -26,6 +29,17 @@ from .models import (
 from .service import KnowledgeGraphService
 
 app = FastAPI(title="Personal ICT Knowledge Graph", version="0.5.0")
+
+# Allow requests from any origin (Vercel frontend, local dev, etc.)
+_cors_origins = os.getenv("CORS_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 service = KnowledgeGraphService()
 
 
