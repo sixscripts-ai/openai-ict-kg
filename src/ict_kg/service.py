@@ -5,6 +5,8 @@ import hashlib
 from collections import Counter, deque
 from typing import Any
 
+import psycopg2.extras
+
 from .db import Database
 from .embeddings import (
     cosine_similarity,
@@ -15,6 +17,12 @@ from .embeddings import (
 )
 from .ingest.connectors import ingest_github_repo_async, ingest_web_page_async
 from .models import EdgeCreate, MemoryCreate, MemoryUpsert, NodeCreate, NodeUpsert, QueryRequest, QueryResult
+
+
+def _row(conn: Any, sql: str, params: tuple = ()) -> Any:
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(sql, params)
+    return cur
 
 
 class KnowledgeGraphService:
@@ -28,6 +36,8 @@ class KnowledgeGraphService:
         emb = self.embedding_provider.embed(f"{title}\n{content}")
         return encode_embedding(emb), self.embedding_provider.name
 
+    # ── Node writes ─────────────────────────────────────────────────────────
+
     def add_node(self, data: NodeCreate) -> dict[str, Any]:
         self.metrics["node_writes"] += 1
         if data.idempotency_key:
@@ -37,31 +47,38 @@ class KnowledgeGraphService:
 
         embedding, model_name = self._embed(data.title, data.content)
         with self.db.connection() as conn:
-            cur = conn.execute(
+            cur = _row(
+                conn,
                 """
                 INSERT INTO nodes (tenant_id, title, content, domain, embedding_model, metadata, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
                 """,
                 (data.tenant_id, data.title, data.content, data.domain, model_name, self.db.dumps(data.metadata), embedding),
             )
-            row = conn.execute("SELECT * FROM nodes WHERE id = ?", (cur.lastrowid,)).fetchone()
+            row = cur.fetchone()
+            node_id = row["id"]
             if data.source_system and data.external_id:
-                conn.execute(
+                _row(
+                    conn,
                     """
-                    INSERT OR IGNORE INTO external_refs (tenant_id, entity_type, entity_id, source_system, external_id)
-                    VALUES (?, 'node', ?, ?, ?)
+                    INSERT INTO external_refs (tenant_id, entity_type, entity_id, source_system, external_id)
+                    VALUES (%s, 'node', %s, %s, %s)
+                    ON CONFLICT DO NOTHING
                     """,
-                    (data.tenant_id, cur.lastrowid, data.source_system, data.external_id),
+                    (data.tenant_id, node_id, data.source_system, data.external_id),
                 )
             if data.idempotency_key:
-                conn.execute(
+                _row(
+                    conn,
                     """
-                    INSERT OR IGNORE INTO idempotency_keys (tenant_id, operation, idempotency_key, entity_type, entity_id)
-                    VALUES (?, 'create_node', ?, 'node', ?)
+                    INSERT INTO idempotency_keys (tenant_id, operation, idempotency_key, entity_type, entity_id)
+                    VALUES (%s, 'create_node', %s, 'node', %s)
+                    ON CONFLICT DO NOTHING
                     """,
-                    (data.tenant_id, data.idempotency_key, cur.lastrowid),
+                    (data.tenant_id, data.idempotency_key, node_id),
                 )
-        return self._hydrate(row)
+        return self._hydrate(dict(row))
 
     def upsert_node(self, data: NodeUpsert) -> dict[str, Any]:
         existing = self._find_by_external_ref(data.tenant_id, data.source_system, data.external_id, "node")
@@ -69,18 +86,24 @@ class KnowledgeGraphService:
             return existing
         return self.add_node(data)
 
+    # ── Edge writes ──────────────────────────────────────────────────────────
+
     def add_edge(self, data: EdgeCreate) -> dict[str, Any]:
         self.metrics["edge_writes"] += 1
         with self.db.connection() as conn:
-            cur = conn.execute(
+            cur = _row(
+                conn,
                 """
                 INSERT INTO edges (tenant_id, source_node_id, target_node_id, relation_type, weight)
-                VALUES (?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s)
+                RETURNING *
                 """,
                 (data.tenant_id, data.source_node_id, data.target_node_id, data.relation_type, data.weight),
             )
-            row = conn.execute("SELECT * FROM edges WHERE id = ?", (cur.lastrowid,)).fetchone()
-        return dict(row)
+            row = cur.fetchone()
+        return self._serialize(dict(row))
+
+    # ── Memory writes ────────────────────────────────────────────────────────
 
     def add_memory(self, data: MemoryCreate) -> dict[str, Any]:
         self.metrics["memory_writes"] += 1
@@ -91,37 +114,46 @@ class KnowledgeGraphService:
 
         embedding, model_name = self._embed(data.title, data.content)
         with self.db.connection() as conn:
-            cur = conn.execute(
+            cur = _row(
+                conn,
                 """
                 INSERT INTO memories (tenant_id, title, content, domain, embedding_model, metadata, embedding)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
                 """,
                 (data.tenant_id, data.title, data.content, data.domain, model_name, self.db.dumps(data.metadata), embedding),
             )
-            row = conn.execute("SELECT * FROM memories WHERE id = ?", (cur.lastrowid,)).fetchone()
+            row = cur.fetchone()
+            mem_id = row["id"]
             if data.source_system and data.external_id:
-                conn.execute(
+                _row(
+                    conn,
                     """
-                    INSERT OR IGNORE INTO external_refs (tenant_id, entity_type, entity_id, source_system, external_id)
-                    VALUES (?, 'memory', ?, ?, ?)
+                    INSERT INTO external_refs (tenant_id, entity_type, entity_id, source_system, external_id)
+                    VALUES (%s, 'memory', %s, %s, %s)
+                    ON CONFLICT DO NOTHING
                     """,
-                    (data.tenant_id, cur.lastrowid, data.source_system, data.external_id),
+                    (data.tenant_id, mem_id, data.source_system, data.external_id),
                 )
             if data.idempotency_key:
-                conn.execute(
+                _row(
+                    conn,
                     """
-                    INSERT OR IGNORE INTO idempotency_keys (tenant_id, operation, idempotency_key, entity_type, entity_id)
-                    VALUES (?, 'create_memory', ?, 'memory', ?)
+                    INSERT INTO idempotency_keys (tenant_id, operation, idempotency_key, entity_type, entity_id)
+                    VALUES (%s, 'create_memory', %s, 'memory', %s)
+                    ON CONFLICT DO NOTHING
                     """,
-                    (data.tenant_id, data.idempotency_key, cur.lastrowid),
+                    (data.tenant_id, data.idempotency_key, mem_id),
                 )
-        return self._hydrate(row)
+        return self._hydrate(dict(row))
 
     def upsert_memory(self, data: MemoryUpsert) -> dict[str, Any]:
         existing = self._find_by_external_ref(data.tenant_id, data.source_system, data.external_id, "memory")
         if existing:
             return existing
         return self.add_memory(data)
+
+    # ── Querying ─────────────────────────────────────────────────────────────
 
     def query(self, request: QueryRequest) -> list[QueryResult]:
         self.metrics["queries"] += 1
@@ -130,60 +162,46 @@ class KnowledgeGraphService:
 
         with self.db.connection() as conn:
             if request.include in ("all", "nodes"):
-                query = "SELECT * FROM nodes WHERE tenant_id = ?"
+                sql = "SELECT * FROM nodes WHERE tenant_id = %s"
                 params: list[Any] = [request.tenant_id]
                 if request.domain:
-                    query += " AND domain = ?"
+                    sql += " AND domain = %s"
                     params.append(request.domain)
-                for row in conn.execute(query + " ORDER BY id DESC", params):
+                cur = _row(conn, sql + " ORDER BY id DESC", tuple(params))
+                for row in cur.fetchall():
                     semantic = cosine_similarity(query_embedding, decode_embedding(row["embedding"]))
-                    rerank = self.reranker.score(request.text, row["title"], row["content"], row["created_at"]) if request.rerank else 0.0
+                    rerank = self.reranker.score(request.text, row["title"], row["content"], str(row["created_at"])) if request.rerank else 0.0
                     score = (0.7 * semantic) + (0.3 * rerank)
-                    results.append(
-                        QueryResult(
-                            item_type="node",
-                            id=row["id"],
-                            title=row["title"],
-                            content=row["content"],
-                            domain=row["domain"],
-                            score=score,
-                            semantic_score=semantic,
-                            rerank_score=rerank,
-                            explanation=f"semantic={semantic:.3f};rerank={rerank:.3f}",
-                        )
-                    )
+                    results.append(QueryResult(
+                        item_type="node", id=row["id"], title=row["title"], content=row["content"],
+                        domain=row["domain"], score=score, semantic_score=semantic, rerank_score=rerank,
+                        explanation=f"semantic={semantic:.3f};rerank={rerank:.3f}",
+                    ))
 
             if request.include in ("all", "memories"):
-                query = "SELECT * FROM memories WHERE tenant_id = ?"
+                sql = "SELECT * FROM memories WHERE tenant_id = %s"
                 params = [request.tenant_id]
                 if request.domain:
-                    query += " AND domain = ?"
+                    sql += " AND domain = %s"
                     params.append(request.domain)
-                for row in conn.execute(query + " ORDER BY id DESC", params):
+                cur = _row(conn, sql + " ORDER BY id DESC", tuple(params))
+                for row in cur.fetchall():
                     semantic = cosine_similarity(query_embedding, decode_embedding(row["embedding"]))
-                    rerank = self.reranker.score(request.text, row["title"], row["content"], row["created_at"]) if request.rerank else 0.0
+                    rerank = self.reranker.score(request.text, row["title"], row["content"], str(row["created_at"])) if request.rerank else 0.0
                     score = (0.7 * semantic) + (0.3 * rerank)
-                    results.append(
-                        QueryResult(
-                            item_type="memory",
-                            id=row["id"],
-                            title=row["title"],
-                            content=row["content"],
-                            domain=row["domain"],
-                            score=score,
-                            semantic_score=semantic,
-                            rerank_score=rerank,
-                            explanation=f"semantic={semantic:.3f};rerank={rerank:.3f}",
-                        )
-                    )
+                    results.append(QueryResult(
+                        item_type="memory", id=row["id"], title=row["title"], content=row["content"],
+                        domain=row["domain"], score=score, semantic_score=semantic, rerank_score=rerank,
+                        explanation=f"semantic={semantic:.3f};rerank={rerank:.3f}",
+                    ))
 
         return sorted(results, key=lambda r: r.score, reverse=True)[: request.top_k]
 
     def graph(self, tenant_id: str = "default") -> dict[str, list[dict[str, Any]]]:
         with self.db.connection() as conn:
-            nodes = [self._hydrate(row) for row in conn.execute("SELECT * FROM nodes WHERE tenant_id = ? ORDER BY id", (tenant_id,))]
-            edges = [dict(row) for row in conn.execute("SELECT * FROM edges WHERE tenant_id = ? ORDER BY id", (tenant_id,))]
-            memories = [self._hydrate(row) for row in conn.execute("SELECT * FROM memories WHERE tenant_id = ? ORDER BY id", (tenant_id,))]
+            nodes = [self._hydrate(dict(r)) for r in _row(conn, "SELECT * FROM nodes WHERE tenant_id = %s ORDER BY id", (tenant_id,)).fetchall()]
+            edges = [self._serialize(dict(r)) for r in _row(conn, "SELECT * FROM edges WHERE tenant_id = %s ORDER BY id", (tenant_id,)).fetchall()]
+            memories = [self._hydrate(dict(r)) for r in _row(conn, "SELECT * FROM memories WHERE tenant_id = %s ORDER BY id", (tenant_id,)).fetchall()]
         return {"nodes": nodes, "edges": edges, "memories": memories}
 
     def neighbors(self, tenant_id: str, node_id: int, depth: int = 1, relation_type: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
@@ -194,22 +212,20 @@ class KnowledgeGraphService:
             for _ in range(max(depth, 1)):
                 if not frontier or len(output) >= limit:
                     break
-                placeholders = ",".join(["?"] * len(frontier))
-                base = (
-                    f"SELECT * FROM edges WHERE tenant_id = ? AND (source_node_id IN ({placeholders}) OR target_node_id IN ({placeholders}))"
-                )
+                placeholders = ",".join(["%s"] * len(frontier))
+                base = f"SELECT * FROM edges WHERE tenant_id = %s AND (source_node_id IN ({placeholders}) OR target_node_id IN ({placeholders}))"
                 params: list[Any] = [tenant_id, *frontier, *frontier]
                 if relation_type:
-                    base += " AND relation_type = ?"
+                    base += " AND relation_type = %s"
                     params.append(relation_type)
-                rows = conn.execute(base, params).fetchall()
+                rows = _row(conn, base, tuple(params)).fetchall()
                 next_frontier: set[int] = set()
                 for row in rows:
                     if len(output) >= limit:
                         break
                     source = int(row["source_node_id"])
                     target = int(row["target_node_id"])
-                    output.append(dict(row))
+                    output.append(self._serialize(dict(row)))
                     if source not in seen:
                         seen.add(source)
                         next_frontier.add(source)
@@ -223,26 +239,16 @@ class KnowledgeGraphService:
         paths = self.k_paths(tenant_id, from_node_id, to_node_id, max_hops=max_hops, k=1, relation_type=relation_type)
         return paths[0] if paths else []
 
-    def k_paths(
-        self,
-        tenant_id: str,
-        from_node_id: int,
-        to_node_id: int,
-        max_hops: int = 6,
-        k: int = 3,
-        relation_type: str | None = None,
-    ) -> list[list[int]]:
+    def k_paths(self, tenant_id: str, from_node_id: int, to_node_id: int, max_hops: int = 6, k: int = 3, relation_type: str | None = None) -> list[list[int]]:
         adjacency: dict[int, set[int]] = {}
         with self.db.connection() as conn:
-            sql = "SELECT source_node_id, target_node_id, relation_type FROM edges WHERE tenant_id = ?"
-            for row in conn.execute(sql, (tenant_id,)):
+            for row in _row(conn, "SELECT source_node_id, target_node_id, relation_type FROM edges WHERE tenant_id = %s", (tenant_id,)).fetchall():
                 if relation_type and row["relation_type"] != relation_type:
                     continue
                 source = int(row["source_node_id"])
                 target = int(row["target_node_id"])
                 adjacency.setdefault(source, set()).add(target)
                 adjacency.setdefault(target, set()).add(source)
-
         found: list[list[int]] = []
         queue: deque[list[int]] = deque([[from_node_id]])
         while queue and len(found) < k:
@@ -259,6 +265,8 @@ class KnowledgeGraphService:
                 queue.append(path + [neighbor])
         return found
 
+    # ── Ingestion ────────────────────────────────────────────────────────────
+
     async def ingest_source_async(self, tenant_id: str, source_system: str, source: str, domain: str) -> dict[str, Any]:
         if source_system == "github":
             items = await ingest_github_repo_async(source)
@@ -273,17 +281,12 @@ class KnowledgeGraphService:
                 if self._chunk_exists(tenant_id, item.source_system, item.external_id, chunk_hash):
                     skipped += 1
                     continue
-                node = self.upsert_node(
-                    NodeUpsert(
-                        tenant_id=tenant_id,
-                        title=item.title,
-                        content=chunk,
-                        domain=domain,
-                        source_system=item.source_system,
-                        external_id=f"{item.external_id}:{chunk_hash[:12]}",
-                        metadata={"source": source},
-                    )
-                )
+                node = self.upsert_node(NodeUpsert(
+                    tenant_id=tenant_id, title=item.title, content=chunk, domain=domain,
+                    source_system=item.source_system,
+                    external_id=f"{item.external_id}:{chunk_hash[:12]}",
+                    metadata={"source": source},
+                ))
                 self._mark_chunk(tenant_id, item.source_system, item.external_id, chunk_hash, node["id"])
                 inserted += 1
 
@@ -313,7 +316,6 @@ class KnowledgeGraphService:
     def get_ingestion_job(self, job_id: int) -> dict[str, Any] | None:
         return self.db.get_ingestion_job(job_id)
 
-
     def list_ingestion_jobs(self, tenant_id: str, limit: int = 50, offset: int = 0) -> tuple[list[dict[str, Any]], int]:
         return self.db.list_ingestion_jobs(tenant_id=tenant_id, limit=limit, offset=offset)
 
@@ -328,29 +330,31 @@ class KnowledgeGraphService:
 
     def ready(self) -> dict[str, str]:
         with self.db.connection() as conn:
-            conn.execute("SELECT 1").fetchone()
+            _row(conn, "SELECT 1").fetchone()
         return {"status": "ready", "embedding_provider": self.embedding_provider.name}
 
     def get_metrics(self) -> dict[str, int]:
         return dict(self.metrics)
 
+    # ── Helpers ──────────────────────────────────────────────────────────────
+
     def _chunk_exists(self, tenant_id: str, source_system: str, external_id: str, chunk_hash: str) -> bool:
         with self.db.connection() as conn:
-            row = conn.execute(
-                """
-                SELECT id FROM ingestion_chunks
-                WHERE tenant_id = ? AND source_system = ? AND external_id = ? AND chunk_hash = ?
-                """,
+            cur = _row(
+                conn,
+                "SELECT id FROM ingestion_chunks WHERE tenant_id = %s AND source_system = %s AND external_id = %s AND chunk_hash = %s",
                 (tenant_id, source_system, external_id, chunk_hash),
-            ).fetchone()
-        return row is not None
+            )
+            return cur.fetchone() is not None
 
     def _mark_chunk(self, tenant_id: str, source_system: str, external_id: str, chunk_hash: str, node_id: int) -> None:
         with self.db.connection() as conn:
-            conn.execute(
+            _row(
+                conn,
                 """
-                INSERT OR IGNORE INTO ingestion_chunks (tenant_id, source_system, external_id, chunk_hash, node_id)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO ingestion_chunks (tenant_id, source_system, external_id, chunk_hash, node_id)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
                 """,
                 (tenant_id, source_system, external_id, chunk_hash, node_id),
             )
@@ -360,17 +364,16 @@ class KnowledgeGraphService:
         normalized = " ".join(text.split())
         if not normalized:
             return []
-        return [normalized[i : i + max_chars] for i in range(0, len(normalized), max_chars)]
+        return [normalized[i: i + max_chars] for i in range(0, len(normalized), max_chars)]
 
     def _find_by_external_ref(self, tenant_id: str, source_system: str, external_id: str, entity_type: str) -> dict[str, Any] | None:
         with self.db.connection() as conn:
-            row = conn.execute(
-                """
-                SELECT entity_id FROM external_refs
-                WHERE tenant_id = ? AND source_system = ? AND external_id = ? AND entity_type = ?
-                """,
+            cur = _row(
+                conn,
+                "SELECT entity_id FROM external_refs WHERE tenant_id = %s AND source_system = %s AND external_id = %s AND entity_type = %s",
                 (tenant_id, source_system, external_id, entity_type),
-            ).fetchone()
+            )
+            row = cur.fetchone()
             if not row:
                 return None
         return self._get_entity(entity_type, row["entity_id"])
@@ -378,22 +381,33 @@ class KnowledgeGraphService:
     def _get_entity(self, entity_type: str, entity_id: int) -> dict[str, Any]:
         with self.db.connection() as conn:
             table = "nodes" if entity_type == "node" else "memories"
-            row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (entity_id,)).fetchone()
-        return self._hydrate(row)
+            cur = _row(conn, f"SELECT * FROM {table} WHERE id = %s", (entity_id,))
+            row = cur.fetchone()
+        return self._hydrate(dict(row))
 
     def _idempotency_lookup(self, tenant_id: str, operation: str, key: str) -> int | None:
         with self.db.connection() as conn:
-            row = conn.execute(
-                """
-                SELECT entity_id FROM idempotency_keys
-                WHERE tenant_id = ? AND operation = ? AND idempotency_key = ?
-                """,
+            cur = _row(
+                conn,
+                "SELECT entity_id FROM idempotency_keys WHERE tenant_id = %s AND operation = %s AND idempotency_key = %s",
                 (tenant_id, operation, key),
-            ).fetchone()
+            )
+            row = cur.fetchone()
         return None if row is None else int(row["entity_id"])
 
-    def _hydrate(self, row: Any) -> dict[str, Any]:
-        payload = dict(row)
+    def _hydrate(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload["metadata"] = self.db.loads(payload.get("metadata", "{}"))
         payload.pop("embedding", None)
+        # Normalize timestamps
+        for k in ("created_at",):
+            if payload.get(k) is not None:
+                payload[k] = str(payload[k])
         return payload
+
+    @staticmethod
+    def _serialize(row: dict[str, Any]) -> dict[str, Any]:
+        """Normalize a raw edge/row dict for JSON serialization."""
+        for k in ("created_at",):
+            if row.get(k) is not None:
+                row[k] = str(row[k])
+        return row
