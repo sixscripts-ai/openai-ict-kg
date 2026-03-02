@@ -1,0 +1,11 @@
+services:
+  ict-kg:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - ICT_KG_JWT_SECRET=change-me
+      - EMBEDDING_PROVIDER=local
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+    volumes:
+      - ./data:/app/data
