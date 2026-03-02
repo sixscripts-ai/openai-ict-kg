@@ -4,3 +4,8 @@ __pycache__/
 data/*.db
 web/node_modules/
 web/dist/
+.venv/
+.env
+web/.env
+uvicorn_log.txt
+*.log

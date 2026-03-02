@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import jwt
@@ -20,7 +20,7 @@ JWT_AUDIENCE = os.getenv("ICT_KG_JWT_AUDIENCE", "")
 def create_access_token(subject: str, tenant_id: str, role: str = "writer") -> str:
     if role not in ALLOWED_ROLES:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid role")
-    now = datetime.now(UTC)
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": subject,
         "tenant_id": tenant_id,
