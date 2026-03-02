@@ -6,53 +6,53 @@ const TENANT_ID = import.meta.env.VITE_TENANT_ID ?? "default";
 const ROLE = import.meta.env.VITE_ROLE ?? "admin";
 
 const CAT = {
-  ICT:           { color: "#00ff88", dim: "#00ff8818", icon: "◆", label: "ICT Concepts" },
-  Trading:       { color: "#ffd700", dim: "#ffd70018", icon: "◈", label: "Trading" },
-  Memory:        { color: "#00cfff", dim: "#00cfff18", icon: "◉", label: "Memory" },
+  ICT: { color: "#00ff88", dim: "#00ff8818", icon: "◆", label: "ICT Concepts" },
+  Trading: { color: "#ffd700", dim: "#ffd70018", icon: "◈", label: "Trading" },
+  Memory: { color: "#00cfff", dim: "#00cfff18", icon: "◉", label: "Memory" },
   KnowledgeBase: { color: "#ff6b35", dim: "#ff6b3518", icon: "◎", label: "Knowledge Base" },
 };
 
 // Edge color by relation type
 const RELATION_COLORS = {
-  similar_to:           "#1a4a1a",
-  related_to:           "#2a3a1a",
-  precedes:             "#4a3a00",
-  confirms:             "#003a4a",
-  targets:              "#4a1a00",
-  is_type_of:           "#2a1a4a",
-  is_part_of:           "#1a2a4a",
-  requires:             "#4a002a",
-  invalidates:          "#4a1a1a",
-  sets_liquidity_for:   "#003a2a",
-  aligns_with:          "#2a3a3a",
-  occurs_during:        "#3a2a00",
-  session_precedes:     "#4a2a00",
-  timeframe_precedes:   "#3a3a00",
-  mentions:             "#1a3a2a",
-  mentioned_in:         "#1a3a2a",
-  divides:              "#2a2a3a",
-  represents:           "#3a1a3a",
+  similar_to: "#1a4a1a",
+  related_to: "#2a3a1a",
+  precedes: "#4a3a00",
+  confirms: "#003a4a",
+  targets: "#4a1a00",
+  is_type_of: "#2a1a4a",
+  is_part_of: "#1a2a4a",
+  requires: "#4a002a",
+  invalidates: "#4a1a1a",
+  sets_liquidity_for: "#003a2a",
+  aligns_with: "#2a3a3a",
+  occurs_during: "#3a2a00",
+  session_precedes: "#4a2a00",
+  timeframe_precedes: "#3a3a00",
+  mentions: "#1a3a2a",
+  mentioned_in: "#1a3a2a",
+  divides: "#2a2a3a",
+  represents: "#3a1a3a",
 };
 
 const RELATION_LABEL_COLORS = {
-  similar_to:           "#2a6a2a",
-  related_to:           "#4a5a2a",
-  precedes:             "#aa8800",
-  confirms:             "#00789a",
-  targets:              "#aa4400",
-  is_type_of:           "#6644aa",
-  is_part_of:           "#4466aa",
-  requires:             "#aa0055",
-  invalidates:          "#aa2222",
-  sets_liquidity_for:   "#00aa77",
-  aligns_with:          "#448888",
-  occurs_during:        "#887700",
-  session_precedes:     "#aa6600",
-  timeframe_precedes:   "#888800",
-  mentions:             "#33887a",
-  mentioned_in:         "#33887a",
-  divides:              "#5566aa",
-  represents:           "#886688",
+  similar_to: "#2a6a2a",
+  related_to: "#4a5a2a",
+  precedes: "#aa8800",
+  confirms: "#00789a",
+  targets: "#aa4400",
+  is_type_of: "#6644aa",
+  is_part_of: "#4466aa",
+  requires: "#aa0055",
+  invalidates: "#aa2222",
+  sets_liquidity_for: "#00aa77",
+  aligns_with: "#448888",
+  occurs_during: "#887700",
+  session_precedes: "#aa6600",
+  timeframe_precedes: "#888800",
+  mentions: "#33887a",
+  mentioned_in: "#33887a",
+  divides: "#5566aa",
+  represents: "#886688",
 };
 
 const RELATION_TYPES = [
@@ -77,25 +77,40 @@ const domainToCat = (d) => {
   return "KnowledgeBase";
 };
 
-async function getToken() {
-  let token = localStorage.getItem("pkg-token");
-  if (token) return token;
+async function freshToken() {
   const r = await fetch(`${API_BASE}/auth/token`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ subject: "frontend-user", tenant_id: TENANT_ID, role: ROLE }),
   });
-  if (!r.ok) throw new Error("Auth failed. Configure JWT/JWKS mode or backend auth.");
+  if (!r.ok) throw new Error("Auth failed");
   const data = await r.json();
-  token = data.access_token;
-  localStorage.setItem("pkg-token", token);
-  return token;
+  localStorage.setItem("pkg-token", data.access_token);
+  return data.access_token;
+}
+
+async function getToken() {
+  const token = localStorage.getItem("pkg-token");
+  if (token) {
+    try {
+      const payload = JSON.parse(atob(token.split(".")[1]));
+      if (payload.exp && payload.exp > Date.now() / 1000 + 30) return token;
+    } catch { /* malformed — refresh */ }
+  }
+  return freshToken();
 }
 
 async function api(path, opts = {}) {
-  const token = await getToken();
+  let token = await getToken();
   const headers = { "Content-Type": "application/json", Authorization: `Bearer ${token}`, ...(opts.headers || {}) };
-  const res = await fetch(`${API_BASE}${path}`, { ...opts, headers });
+  let res = await fetch(`${API_BASE}${path}`, { ...opts, headers });
+  if (res.status === 401) {
+    // Token rejected — get a fresh one and retry once
+    localStorage.removeItem("pkg-token");
+    token = await freshToken();
+    headers.Authorization = `Bearer ${token}`;
+    res = await fetch(`${API_BASE}${path}`, { ...opts, headers });
+  }
   if (!res.ok) {
     const txt = await res.text();
     throw new Error(`${res.status}: ${txt}`);
@@ -113,7 +128,7 @@ async function askAssistant(prompt) {
 }
 
 export default function PKG() {
-  const svgRef  = useRef(null);
+  const svgRef = useRef(null);
   const wrapRef = useRef(null);
 
   const [nodes, setNodes] = useState([]);
@@ -124,12 +139,12 @@ export default function PKG() {
   const [selected, setSelected] = useState(null);
   const [filterCat, setFilterCat] = useState("ALL");
   const [searchQ, setSearchQ] = useState("");
-  const [chatMsgs, setChatMsgs] = useState([{ role:"assistant", content:"Connected to your PKG backend. Ask anything." }]);
+  const [chatMsgs, setChatMsgs] = useState([{ role: "assistant", content: "Connected to your PKG backend. Ask anything." }]);
   const [chatInput, setChatInput] = useState("");
   const [chatBusy, setChatBusy] = useState(false);
   const [saveMsg, setSaveMsg] = useState("");
-  const [form, setForm] = useState({ label:"", category:"ICT", description:"", tags:"" });
-  const [linkForm, setLinkForm] = useState({ source:"", relation:"related_to", target:"" });
+  const [form, setForm] = useState({ label: "", category: "ICT", description: "", tags: "" });
+  const [linkForm, setLinkForm] = useState({ source: "", relation: "related_to", target: "" });
   // Quick-connect modal state (Phase 4)
   const [connectModal, setConnectModal] = useState(false);
   const [connectForm, setConnectForm] = useState({ relation: "related_to", target: "" });
@@ -230,8 +245,8 @@ export default function PKG() {
         .on("click", (evt, d) => { evt.stopPropagation(); setSelected(nodes.find(n => n.id === d.id) || null); setPanel("info"); })
         .call(d3.drag()
           .on("start", (e, d) => { if (!e.active) sim.alphaTarget(0.3).restart(); d.fx = d.x; d.fy = d.y; })
-          .on("drag",  (e, d) => { d.fx = e.x; d.fy = e.y; })
-          .on("end",   (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
+          .on("drag", (e, d) => { d.fx = e.x; d.fy = e.y; })
+          .on("end", (e, d) => { if (!e.active) sim.alphaTarget(0); d.fx = null; d.fy = null; })
         );
 
       nodeG.append("circle").attr("r", 18)
@@ -327,11 +342,11 @@ export default function PKG() {
 
   const conns = selected
     ? edges.filter(e => e.source === selected.id || e.target === selected.id).map(e => {
-        const out = e.source === selected.id;
-        const oid = out ? e.target : e.source;
-        const other = nodes.find(n => n.id === oid);
-        return other ? { node: other, edge: e, out } : null;
-      }).filter(Boolean)
+      const out = e.source === selected.id;
+      const oid = out ? e.target : e.source;
+      const other = nodes.find(n => n.id === oid);
+      return other ? { node: other, edge: e, out } : null;
+    }).filter(Boolean)
     : [];
 
   const S = {
@@ -533,4 +548,3 @@ export default function PKG() {
     </div>
   );
 }
-// v2 1772468951
