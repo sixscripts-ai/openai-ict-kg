@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 from collections import Counter, deque
 from typing import Any
 
@@ -17,6 +18,9 @@ from .embeddings import (
 )
 from .ingest.connectors import ingest_github_repo_async, ingest_web_page_async
 from .models import EdgeCreate, MemoryCreate, MemoryUpsert, NodeCreate, NodeUpsert, QueryRequest, QueryResult
+
+_ENABLE_NER = os.getenv("ENABLE_NER", "false").lower() == "true"
+_ENABLE_RELATIONS = os.getenv("ENABLE_RELATION_EXTRACTION", "false").lower() == "true"
 
 
 def _row(conn: Any, sql: str, params: tuple = ()) -> Any:
@@ -275,6 +279,8 @@ class KnowledgeGraphService:
 
         inserted = 0
         skipped = 0
+        concept_nodes: list[dict[str, Any]] = []
+
         for item in items:
             for chunk in self._chunk_text(item.content):
                 chunk_hash = hashlib.sha256(chunk.encode("utf-8")).hexdigest()
@@ -288,10 +294,81 @@ class KnowledgeGraphService:
                     metadata={"source": source},
                 ))
                 self._mark_chunk(tenant_id, item.source_system, item.external_id, chunk_hash, node["id"])
+                concept_nodes.append(node)
                 inserted += 1
+
+                # Phase 2A — NER: extract ICT concept nodes from each chunk
+                if _ENABLE_NER:
+                    self._extract_and_link_concepts(tenant_id, domain, chunk, node["id"])
+
+                # Phase 2C — Relation triples from each chunk
+                if _ENABLE_RELATIONS:
+                    self._extract_and_wire_triples(tenant_id, domain, chunk)
 
         self.metrics["ingested_chunks"] += inserted
         return {"inserted_chunks": inserted, "skipped_chunks": skipped, "items": len(items)}
+
+    def _extract_and_link_concepts(self, tenant_id: str, domain: str, chunk: str, source_node_id: int) -> None:
+        """Phase 2A: NER — create concept nodes and link them to the source chunk."""
+        from .ingest.relations import extract_concepts
+        concepts = extract_concepts(chunk)
+        for concept in concepts:
+            if not concept.strip():
+                continue
+            concept_node = self.upsert_node(NodeUpsert(
+                tenant_id=tenant_id,
+                title=concept,
+                content=f"ICT concept: {concept}",
+                domain=domain,
+                source_system="ner",
+                external_id=f"ner:{concept.lower().replace(' ', '_')}",
+                metadata={"extracted_by": "ner"},
+            ))
+            # Link: source chunk → mentions → concept node
+            try:
+                self.add_edge(EdgeCreate(
+                    tenant_id=tenant_id,
+                    source_node_id=source_node_id,
+                    target_node_id=concept_node["id"],
+                    relation_type="mentions",
+                    weight=1.0,
+                ))
+            except Exception:  # noqa: BLE001
+                pass  # edge may already exist
+
+    def _extract_and_wire_triples(self, tenant_id: str, domain: str, chunk: str) -> None:
+        """Phase 2C: Relation extraction — create nodes and typed edges from triples."""
+        from .ingest.relations import extract_triples
+        triples = extract_triples(chunk)
+        for triple in triples:
+            subject_node = self.upsert_node(NodeUpsert(
+                tenant_id=tenant_id,
+                title=triple["subject"],
+                content=f"ICT concept: {triple['subject']}",
+                domain=domain,
+                source_system="relation_extraction",
+                external_id=f"re:{triple['subject'].lower().replace(' ', '_')}",
+                metadata={"extracted_by": "relation_extraction"},
+            ))
+            object_node = self.upsert_node(NodeUpsert(
+                tenant_id=tenant_id,
+                title=triple["object"],
+                content=f"ICT concept: {triple['object']}",
+                domain=domain,
+                source_system="relation_extraction",
+                external_id=f"re:{triple['object'].lower().replace(' ', '_')}",
+                metadata={"extracted_by": "relation_extraction"},
+            ))
+            try:
+                self.add_edge(EdgeCreate(
+                    tenant_id=tenant_id,
+                    source_node_id=subject_node["id"],
+                    target_node_id=object_node["id"],
+                    relation_type=triple["relation"],
+                    weight=1.0,
+                ))
+            except Exception:  # noqa: BLE001
+                pass
 
     def process_ingestion_job(self, job_id: int) -> None:
         job = self.db.get_ingestion_job(job_id)
@@ -301,9 +378,22 @@ class KnowledgeGraphService:
         try:
             result = asyncio.run(self.ingest_source_async(job["tenant_id"], job["source_system"], job["source"], job["domain"]))
             self.db.update_ingestion_job(job_id, status="completed", result=result)
+            # Phase 1 — auto-wire edges after every successful ingest
+            self._auto_wire(job["tenant_id"])
         except Exception as exc:  # noqa: BLE001
             self.metrics["ingest_failures"] += 1
             self.db.update_ingestion_job(job_id, status="failed", error=str(exc), result={})
+
+    def _auto_wire(self, tenant_id: str) -> None:
+        """Run auto_wire_edges silently after ingestion."""
+        try:
+            from .wiring import auto_wire_edges
+            counts = auto_wire_edges(self.db, tenant_id=tenant_id)
+            total = sum(counts.values())
+            self.metrics["auto_wired_edges"] += total
+        except Exception as exc:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).warning("auto_wire_edges failed: %s", exc)
 
     def create_ingestion_job(self, tenant_id: str, source_system: str, source: str, domain: str) -> dict[str, Any]:
         job_id = self.db.create_ingestion_job(tenant_id, source_system, source, domain)
@@ -398,7 +488,6 @@ class KnowledgeGraphService:
     def _hydrate(self, payload: dict[str, Any]) -> dict[str, Any]:
         payload["metadata"] = self.db.loads(payload.get("metadata", "{}"))
         payload.pop("embedding", None)
-        # Normalize timestamps
         for k in ("created_at",):
             if payload.get(k) is not None:
                 payload[k] = str(payload[k])
@@ -406,7 +495,6 @@ class KnowledgeGraphService:
 
     @staticmethod
     def _serialize(row: dict[str, Any]) -> dict[str, Any]:
-        """Normalize a raw edge/row dict for JSON serialization."""
         for k in ("created_at",):
             if row.get(k) is not None:
                 row[k] = str(row[k])
